@@ -2263,7 +2263,7 @@ class TestAutoConfig:
         get_chat_model("claude-sonnet-4-6")
 
         call_kwargs = mock_init.call_args[1]
-        assert call_kwargs["thinking"] == {"type": "adaptive"}
+        assert call_kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert call_kwargs["effort"] == "max"
 
     @patch("EvoScientist.llm.models.init_chat_model")
@@ -2275,7 +2275,7 @@ class TestAutoConfig:
         get_chat_model("claude-opus-4-8")
 
         call_kwargs = mock_init.call_args[1]
-        assert call_kwargs["thinking"] == {"type": "adaptive"}
+        assert call_kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert call_kwargs["effort"] == "max"
 
     @patch("EvoScientist.llm.models.init_chat_model")
@@ -2313,7 +2313,7 @@ class TestAutoConfig:
         get_chat_model("claude-sonnet-4-6")
 
         call_kwargs = mock_init.call_args[1]
-        assert call_kwargs["thinking"] == {"type": "adaptive"}
+        assert call_kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert call_kwargs["effort"] == "max"
 
     @patch("EvoScientist.llm.models.init_chat_model")
