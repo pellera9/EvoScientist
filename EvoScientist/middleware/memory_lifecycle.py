@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, TypeVar, cast
 
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, filter_messages
@@ -44,7 +44,7 @@ from ..memory.worker_activity import (
 )
 
 if TYPE_CHECKING:
-    from langgraph_sdk.schema import Config, Input
+    from langgraph_sdk.schema import Config, Input, Run, Thread
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,7 @@ class MemoryWorkerLaunchArgs(TypedDict):
 
     role: MemoryLifecycleRole
     memory_dir: str | Path
+    workspace_dir: str | Path
     project_id: str
     source_agent: str
     session_id: str
@@ -152,6 +153,62 @@ class MemoryWorkerRunPayload(TypedDict):
     input: Input
     metadata: dict[str, str]
     config: Config
+
+
+class _SyncMemoryWorkerThreads(Protocol):
+    def create(
+        self,
+        *,
+        graph_id: str,
+        metadata: dict[str, str],
+    ) -> Thread: ...
+
+
+class _SyncMemoryWorkerRuns(Protocol):
+    def create(
+        self,
+        thread_id: str,
+        assistant_id: str,
+        *,
+        input: Input,
+        metadata: dict[str, str],
+        config: Config,
+    ) -> Run: ...
+
+    def get(self, thread_id: str, run_id: str) -> Run: ...
+
+
+class _SyncMemoryWorkerClient(Protocol):
+    threads: _SyncMemoryWorkerThreads
+    runs: _SyncMemoryWorkerRuns
+
+
+class _AsyncMemoryWorkerThreads(Protocol):
+    async def create(
+        self,
+        *,
+        graph_id: str,
+        metadata: dict[str, str],
+    ) -> Thread: ...
+
+
+class _AsyncMemoryWorkerRuns(Protocol):
+    async def create(
+        self,
+        thread_id: str,
+        assistant_id: str,
+        *,
+        input: Input,
+        metadata: dict[str, str],
+        config: Config,
+    ) -> Run: ...
+
+    async def get(self, thread_id: str, run_id: str) -> Run: ...
+
+
+class _AsyncMemoryWorkerClient(Protocol):
+    threads: _AsyncMemoryWorkerThreads
+    runs: _AsyncMemoryWorkerRuns
 
 
 @dataclass(frozen=True)
@@ -617,20 +674,6 @@ def _safe_segment(value: str) -> str:
     return safe.strip("-") or "unknown"
 
 
-def _worker_thread_id(
-    *,
-    role: MemoryLifecycleRole,
-    session_id: str,
-    source_agent: str,
-    trajectory: list[CompactMessage],
-) -> str:
-    """Return a deterministic thread id for a background worker run."""
-    key = "\n".join(
-        [role.value, session_id, source_agent, _trajectory_digest(trajectory)]
-    )
-    return f"evomemory-{role.value}:{_short_hash(key)}"
-
-
 def _agent_result_model(result: Mapping[str, object], model_type: type[T]) -> T | None:
     """Extract a DeepAgents/LangChain structured response from agent state."""
     value = result.get("structured_response")
@@ -952,30 +995,49 @@ def _runs_create_kwargs(kwargs: MemoryWorkerRunPayload) -> MemoryWorkerRunPayloa
     return cast("MemoryWorkerRunPayload", _merge_runs_config_kwargs(dict(kwargs)))
 
 
+def _worker_workspace_dir(workspace_dir: str | Path) -> str:
+    return str(Path(workspace_dir).expanduser().resolve())
+
+
+def _memory_worker_metadata(
+    *,
+    role: MemoryLifecycleRole,
+    workspace_dir: str | Path,
+    project_id: str,
+    source_agent: str,
+    session_id: str,
+    trajectory_digest: str,
+) -> dict[str, str]:
+    return {
+        "run_kind": f"evomemory_{role.value}_worker",
+        "source_session_id": session_id,
+        "source_agent": source_agent,
+        "project_id": project_id,
+        "trajectory_digest": trajectory_digest,
+        "workspace_dir": _worker_workspace_dir(workspace_dir),
+    }
+
+
 def _memory_worker_run_kwargs(
     *,
     role: MemoryLifecycleRole,
+    thread_id: str,
+    workspace_dir: str | Path,
     project_id: str,
     source_agent: str,
     session_id: str,
     trajectory: list[CompactMessage],
 ) -> MemoryWorkerRunPayload:
     """Build the LangGraph SDK run payload for a memory worker."""
-    worker_thread_id = _worker_thread_id(
-        role=role,
-        session_id=session_id,
-        source_agent=source_agent,
-        trajectory=trajectory,
-    )
     trajectory_digest = _trajectory_digest(trajectory)
-    metadata = {
-        "agent_name": "EvoScientist",
-        "run_kind": f"evomemory_{role.value}_worker",
-        "source_session_id": session_id,
-        "source_agent": source_agent,
-        "project_id": project_id,
-        "trajectory_digest": trajectory_digest,
-    }
+    metadata = _memory_worker_metadata(
+        role=role,
+        workspace_dir=workspace_dir,
+        project_id=project_id,
+        source_agent=source_agent,
+        session_id=session_id,
+        trajectory_digest=trajectory_digest,
+    )
     payload: MemoryWorkerRunPayload = {
         "assistant_id": role.graph_id,
         "input": {
@@ -993,7 +1055,7 @@ def _memory_worker_run_kwargs(
         "metadata": metadata,
         "config": {
             "configurable": {
-                "thread_id": worker_thread_id,
+                "thread_id": thread_id,
                 "evomemory_source_session_id": session_id,
                 "evomemory_source_agent": source_agent,
                 "evomemory_project_id": project_id,
@@ -1126,7 +1188,7 @@ def _watch_memory_worker_run_sync(
 
 
 def _spawn_memory_worker_status_task(
-    client: Any,
+    client: _AsyncMemoryWorkerClient,
     *,
     thread_id: str,
     run_id: str,
@@ -1140,7 +1202,7 @@ def _spawn_memory_worker_status_task(
 
 
 async def _watch_memory_worker_run_async(
-    client: Any,
+    client: _AsyncMemoryWorkerClient,
     *,
     thread_id: str,
     run_id: str,
@@ -1189,6 +1251,7 @@ def _launch_memory_worker(
     *,
     role: MemoryLifecycleRole,
     memory_dir: str | Path,
+    workspace_dir: str | Path,
     project_id: str,
     source_agent: str,
     session_id: str,
@@ -1204,12 +1267,24 @@ def _launch_memory_worker(
         logger.info("Skipping EvoMemory worker launch; LangGraph dev is unavailable")
         return
 
-    client = get_sync_client(url=url, headers={"x-auth-scheme": "langsmith"})
-    thread = client.threads.create(graph_id=role.graph_id)
+    client: _SyncMemoryWorkerClient = get_sync_client(
+        url=url, headers={"x-auth-scheme": "langsmith"}
+    )
+    metadata = _memory_worker_metadata(
+        role=role,
+        workspace_dir=workspace_dir,
+        project_id=project_id,
+        source_agent=source_agent,
+        session_id=session_id,
+        trajectory_digest=_trajectory_digest(trajectory),
+    )
+    thread = client.threads.create(graph_id=role.graph_id, metadata=metadata)
     worker_thread_id = str(thread["thread_id"])
     before_outputs = snapshot_memory_outputs(memory_dir)
     payload = _memory_worker_run_kwargs(
         role=role,
+        thread_id=worker_thread_id,
+        workspace_dir=workspace_dir,
         project_id=project_id,
         source_agent=source_agent,
         session_id=session_id,
@@ -1244,6 +1319,7 @@ async def _alaunch_memory_worker(
     *,
     role: MemoryLifecycleRole,
     memory_dir: str | Path,
+    workspace_dir: str | Path,
     project_id: str,
     source_agent: str,
     session_id: str,
@@ -1259,12 +1335,24 @@ async def _alaunch_memory_worker(
         logger.info("Skipping EvoMemory worker launch; LangGraph dev is unavailable")
         return
 
-    client = get_client(url=url, headers={"x-auth-scheme": "langsmith"})
-    thread = await client.threads.create(graph_id=role.graph_id)
+    client: _AsyncMemoryWorkerClient = get_client(
+        url=url, headers={"x-auth-scheme": "langsmith"}
+    )
+    metadata = _memory_worker_metadata(
+        role=role,
+        workspace_dir=workspace_dir,
+        project_id=project_id,
+        source_agent=source_agent,
+        session_id=session_id,
+        trajectory_digest=_trajectory_digest(trajectory),
+    )
+    thread = await client.threads.create(graph_id=role.graph_id, metadata=metadata)
     worker_thread_id = str(thread["thread_id"])
     before_outputs = await asyncio.to_thread(snapshot_memory_outputs, memory_dir)
     payload = _memory_worker_run_kwargs(
         role=role,
+        thread_id=worker_thread_id,
+        workspace_dir=workspace_dir,
         project_id=project_id,
         source_agent=source_agent,
         session_id=session_id,
@@ -1310,6 +1398,9 @@ class EvoMemoryLifecycleMiddleware(AgentMiddleware):
         source_agent: str,
     ) -> None:
         self._memory_dir = Path(memory_dir).expanduser()
+        self._workspace_dir = Path(
+            _paths.WORKSPACE_ROOT if workspace_dir is None else workspace_dir
+        ).expanduser()
         self._project_id = project_id
         self._role = role
         self._source_agent = source_agent
@@ -1329,6 +1420,7 @@ class EvoMemoryLifecycleMiddleware(AgentMiddleware):
             return {
                 "role": MemoryLifecycleRole.TURN,
                 "memory_dir": self._memory_dir,
+                "workspace_dir": self._workspace_dir,
                 "project_id": self._project_id,
                 "source_agent": self._source_agent,
                 "session_id": session_id,
@@ -1341,6 +1433,7 @@ class EvoMemoryLifecycleMiddleware(AgentMiddleware):
         return {
             "role": MemoryLifecycleRole.SUBAGENT,
             "memory_dir": self._memory_dir,
+            "workspace_dir": self._workspace_dir,
             "project_id": self._project_id,
             "source_agent": self._source_agent,
             "session_id": session_id,

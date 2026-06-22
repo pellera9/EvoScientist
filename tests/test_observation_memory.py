@@ -777,13 +777,20 @@ def test_subagent_summary_writer_uses_worker_metadata(tmp_path, monkeypatch):
     assert _markdown_sections(body) == {"Summary": summary}
 
 
-def test_memory_worker_run_kwargs_use_graph_id_and_source_metadata_only():
+def test_memory_worker_run_kwargs_use_server_thread_id_and_source_metadata(monkeypatch):
+    monkeypatch.setattr(
+        memory_lifecycle,
+        "_worker_workspace_dir",
+        lambda _workspace_dir: "/tmp/ws",
+    )
     trajectory: list[memory_lifecycle.CompactMessage] = [
         {"role": "human", "content": "hi"}
     ]
 
     kwargs = memory_lifecycle._memory_worker_run_kwargs(
         role=memory_lifecycle.MemoryLifecycleRole.SUBAGENT,
+        thread_id="worker-thread",
+        workspace_dir="/active/workspace",
         project_id="P-project",
         source_agent="writing-agent",
         session_id="thread-1",
@@ -792,20 +799,15 @@ def test_memory_worker_run_kwargs_use_graph_id_and_source_metadata_only():
 
     assert kwargs["assistant_id"] == memory_lifecycle.SUBAGENT_MEMORY_WORKER_GRAPH_ID
     assert kwargs["metadata"] == {
-        "agent_name": "EvoScientist",
         "run_kind": "evomemory_subagent_worker",
         "source_session_id": "thread-1",
         "source_agent": "writing-agent",
         "project_id": "P-project",
         "trajectory_digest": memory_lifecycle._trajectory_digest(trajectory),
+        "workspace_dir": "/tmp/ws",
     }
     configurable = kwargs["config"]["configurable"]
-    assert configurable["thread_id"] == memory_lifecycle._worker_thread_id(
-        role=memory_lifecycle.MemoryLifecycleRole.SUBAGENT,
-        session_id="thread-1",
-        source_agent="writing-agent",
-        trajectory=trajectory,
-    )
+    assert configurable["thread_id"] == "worker-thread"
     assert {
         key: value
         for key, value in configurable.items()
@@ -1285,6 +1287,7 @@ def test_memory_worker_skips_when_langgraph_dev_unavailable(tmp_path, monkeypatc
     memory_lifecycle._launch_memory_worker(
         role=memory_lifecycle.MemoryLifecycleRole.TURN,
         memory_dir=tmp_path / "memories",
+        workspace_dir=tmp_path / "workspace",
         project_id="P-project",
         source_agent="EvoScientist",
         session_id="thread-1",
@@ -1295,6 +1298,11 @@ def test_memory_worker_skips_when_langgraph_dev_unavailable(tmp_path, monkeypatc
 def test_memory_worker_launch_marks_active_status(tmp_path, monkeypatch):
     worker_activity.reset_memory_worker_status_for_tests()
     monkeypatch.setattr(memory_lifecycle, "_memory_worker_url", lambda: "http://x")
+    monkeypatch.setattr(
+        memory_lifecycle,
+        "_worker_workspace_dir",
+        lambda _workspace_dir: "/tmp/ws",
+    )
     monkeypatch.setattr(
         "EvoScientist.langgraph_dev.manager.is_langgraph_dev_running",
         lambda **_kwargs: True,
@@ -1320,6 +1328,7 @@ def test_memory_worker_launch_marks_active_status(tmp_path, monkeypatch):
     memory_lifecycle._launch_memory_worker(
         role=memory_lifecycle.MemoryLifecycleRole.TURN,
         memory_dir=memory_dir,
+        workspace_dir=tmp_path / "workspace",
         project_id="P-project",
         source_agent="EvoScientist",
         session_id="thread-1",
@@ -1328,6 +1337,23 @@ def test_memory_worker_launch_marks_active_status(tmp_path, monkeypatch):
 
     try:
         assert worker_activity.memory_worker_status().is_running is True
+        expected_metadata = {
+            "run_kind": "evomemory_turn_worker",
+            "source_session_id": "thread-1",
+            "source_agent": "EvoScientist",
+            "project_id": "P-project",
+            "trajectory_digest": memory_lifecycle._trajectory_digest(trajectory),
+            "workspace_dir": "/tmp/ws",
+        }
+        fake_client.threads.create.assert_called_once_with(
+            graph_id=memory_lifecycle.TURN_MEMORY_WORKER_GRAPH_ID,
+            metadata=expected_metadata,
+        )
+        fake_client.runs.create.assert_called_once()
+        run_kwargs = fake_client.runs.create.call_args.kwargs
+        assert run_kwargs["thread_id"] == "worker-thread"
+        assert run_kwargs["metadata"] == expected_metadata
+        assert run_kwargs["config"]["configurable"]["thread_id"] == "worker-thread"
         assert spawned == [
             {"url": "http://x", "thread_id": "worker-thread", "run_id": "run-1"}
         ]
@@ -1351,6 +1377,11 @@ def test_async_memory_worker_launch_offloads_blocking_work(
 ):
     worker_activity.reset_memory_worker_status_for_tests()
     monkeypatch.setattr(memory_lifecycle, "_memory_worker_url", lambda: "http://x")
+    monkeypatch.setattr(
+        memory_lifecycle,
+        "_worker_workspace_dir",
+        lambda _workspace_dir: "/tmp/ws",
+    )
 
     call_threads: list[tuple[str, int]] = []
 
@@ -1394,6 +1425,7 @@ def test_async_memory_worker_launch_offloads_blocking_work(
         await memory_lifecycle._alaunch_memory_worker(
             role=memory_lifecycle.MemoryLifecycleRole.TURN,
             memory_dir=tmp_path / "memories",
+            workspace_dir=tmp_path / "workspace",
             project_id="P-project",
             source_agent="EvoScientist",
             session_id="thread-1",
